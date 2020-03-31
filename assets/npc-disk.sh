@@ -41,18 +41,17 @@ find_or_create_disk(){
 			local DISK_CAPACITY="$(jq '.capacity//empty'<<<"$OPTIONS")"
 			[ ! -z "$DISK_CAPACITY" ] || DISK_CAPACITY="$(kubectl get pv "$DISK_NAME" -o json | jq -r '.spec.capacity.storage//empty')"
 			[ ! -z "$DISK_CAPACITY" ] || DISK_CAPACITY="10G"
-			local CREATE_DISK="$(jq --arg name "$DISK_NAME" --arg capacity "$DISK_CAPACITY" --argjson instance "$INSTANCE" -c '{
-				volume_name: $name,
-				az_name: (.zone//.az//$instance.zone),
-				type: (if .type then ({
-						CloudSsd: "C_SSD",
-						CloudHighPerformanceSsd: "NBS_SSD",
-						CloudSas:"C_SAS"
-					})[.type]//.type else .type end),
-				format: "Raw",
-				size: ($capacity|sub("[Gg]i?$"; "") | tonumber/10 | if . > floor then floor + 1 else . end * 10)
-			}|with_entries(select(.value))'<<<"$OPTIONS")"
-			DISK_ID="$(npc api 'json.id//empty' POST "/api/v1/cloud-volumes" "$CREATE_DISK")" && [ ! -z "$DISK_ID" ] || return 2
+			DISK_ID="$(npc api2 'json | .DiskIds[0]//empty' \
+              GET "/ncv?Action=CreateDisk&Version=2017-12-28&$(jq -r --arg name "$DISK_NAME" --arg capacity "$DISK_CAPACITY" --argjson instance "$INSTANCE" '{
+                  Name: $name,
+                  ZoneId: (.zone//.az//$instance.zone),
+                  Scope: "NVM",
+                  PricingModel: "PostPaid",
+                  Type: (if .type then .type else "CloudSsd" end),
+                  Capacity: ($capacity|sub("[Gg]i?$"; "") | tonumber/10 | if . > floor then floor + 1 else . end * 10)
+                }|to_entries|map(@uri"\(.key)=\(.value)")|join("&")'<<<"$OPTIONS"
+              )"
+      )" && [ ! -z "$DISK_ID" ] || return 2
 		}
 	}
 	wait_disk "$DISK_ID" || return 2
@@ -61,11 +60,11 @@ find_or_create_disk(){
 wait_disk(){
 	local DISK_ID="$1" WAIT_STATUS WAIT_RESULT
 	while true; do
-		read -r WAIT_STATUS WAIT_RESULT < <(npc api 'json | select(.id) | .status as $status |
-			if ["creating","mounting","unmounting"]|index($status) then "wait"
-			elif [".create_fail"]|index($status) then "destroy"
-			else "ok \(.name) \(.id) \(.volume_uuid) \(.service_name//"")"
-			end' GET "/api/v1/cloud-volumes/$DISK_ID") && case "$WAIT_STATUS" in
+		read -r WAIT_STATUS WAIT_RESULT < <(npc api2 'json | .DiskCxt | select(.DiskId) | .Status as $status |
+      if ["creating","mounting","unmounting"]|index($status) then "wait"
+      elif [".create_fail"]|index($status) then "destroy"
+      else "ok \(.DiskName) \(.DiskId) \(.VolumeUUID) \(.AttachedInstance//"")"
+      end' GET "/ncv?Action=DescribeDisk&Version=2017-12-28&DiskId=$DISK_ID") && case "$WAIT_STATUS" in
 			ok)
 				log "disk: $WAIT_RESULT"
 				echo "$WAIT_RESULT"; return 0
@@ -76,7 +75,7 @@ wait_disk(){
 				;;
 			destroy)
 				log "destroy disk"
-				npc api DELETE "/api/v1/cloud-volumes/$DISK_ID" >&2
+				npc api2 GET "/ncv?Action=DeleteDisk&Version=2017-12-28&DiskId=$DISK_ID" >&2
 				return 2
 				;;
 		esac
